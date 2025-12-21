@@ -775,11 +775,20 @@ def generate_tick_music(model: nn.Module, seed_sequence: np.ndarray,
 
         top_indices = np.argsort(vel_probs)[-top_k:]
 
-        for idx in top_indices:
-            if np.random.random() < vel_probs[idx]:
-                next_vel[idx] = np.clip(vel_probs[idx] + 0.2, 0.3, 1.0)  # Ensure audible
-                # Duration: sigmoid and clamp
-                next_dur[idx] = np.clip(1 / (1 + np.exp(-dur_logits[idx])), 0.1, 1.0)
+        # ALWAYS include top-2 notes (forced) to ensure music plays
+        # Then probabilistically add more from top-k
+        min_forced = 2  # Always include at least 2 notes per tick
+
+        for rank, idx in enumerate(reversed(top_indices)):  # highest prob first
+            if rank < min_forced:
+                # Force include top notes
+                next_vel[idx] = np.clip(vel_probs[idx] + 0.4, 0.5, 1.0)
+                next_dur[idx] = np.clip(1 / (1 + np.exp(-dur_logits[idx])), 0.2, 1.0)
+            else:
+                # Probabilistic for the rest
+                if np.random.random() < vel_probs[idx]:
+                    next_vel[idx] = np.clip(vel_probs[idx] + 0.3, 0.4, 1.0)
+                    next_dur[idx] = np.clip(1 / (1 + np.exp(-dur_logits[idx])), 0.1, 1.0)
 
         # Combine and append
         next_frame = np.concatenate([next_vel, next_dur])
