@@ -27,8 +27,8 @@ from tqdm.auto import tqdm
 
 # Positive class weight for BCEWithLogitsLoss to handle data imbalance
 # Piano rolls are ~95% zeros, so we weight positive (note-on) samples more heavily
-# This prevents the model from learning to predict "silence everywhere"
-POS_WEIGHT = 20.0  # Weight for positive class (note-on events)
+# Too low (1) = predicts silence, too high (20) = predicts noise
+POS_WEIGHT = 5.0  # Balanced weight for positive class
 
 MIDI_CONFIG = {
     "min_pitch": 21,       # A0 (lowest piano key)
@@ -38,8 +38,14 @@ MIDI_CONFIG = {
     "max_duration": 60,    # Max clip duration in seconds
 }
 
+# Tick-based encoding config
+TICKS_PER_BEAT = 4        # 16th note resolution (4 ticks = 1 beat)
+MAX_DURATION_TICKS = 32   # Max note duration in ticks (2 bars)
+DEFAULT_TEMPO = 120       # BPM for conversion
+
 NUM_PITCHES = MIDI_CONFIG["max_pitch"] - MIDI_CONFIG["min_pitch"] + 1  # 88 piano keys
-SEQUENCE_LENGTH = 64   # Input sequence length
+TICK_FEATURES = NUM_PITCHES * 2  # 88 pitches × 2 (velocity + duration) = 176
+SEQUENCE_LENGTH = 64   # Input sequence length (ticks)
 STRIDE = 16            # Sliding window stride
 SEED = 42
 
@@ -345,6 +351,183 @@ def piano_roll_to_midi(piano_roll: np.ndarray, config: dict,
 
 
 # =============================================================================
+# TICK-BASED ENCODING (Alternative to Piano Roll)
+# =============================================================================
+
+def midi_to_tick_sequence(midi_path: Path, ticks_per_beat: int = TICKS_PER_BEAT,
+                          max_ticks: int = None, trim_silence: bool = True
+                          ) -> Optional[np.ndarray]:
+    """
+    Convert MIDI to tick-based sequence with velocity and duration.
+
+    Each tick is a 16th note. Output shape: (num_ticks, 88, 2)
+    - Channel 0: velocity (0 = no note, >0 = note velocity)
+    - Channel 1: duration in ticks (how long the note lasts)
+
+    Args:
+        midi_path: Path to MIDI file
+        ticks_per_beat: Resolution (4 = 16th notes)
+        max_ticks: Maximum number of ticks (None = no limit)
+        trim_silence: Remove leading silence
+
+    Returns:
+        Array of shape (num_ticks, 88, 2) or None if error
+    """
+    try:
+        midi = pretty_midi.PrettyMIDI(str(midi_path))
+    except Exception as e:
+        print(f"Error loading {midi_path}: {e}")
+        return None
+
+    if midi.get_end_time() < 1.0:
+        return None
+
+    # Get tempo (use first tempo or default)
+    tempo = DEFAULT_TEMPO
+    if midi.get_tempo_changes()[1].size > 0:
+        tempo = midi.get_tempo_changes()[1][0]
+
+    # Calculate tick duration in seconds
+    beat_duration = 60.0 / tempo  # seconds per beat
+    tick_duration = beat_duration / ticks_per_beat  # seconds per tick
+
+    # Calculate total ticks needed
+    end_time = midi.get_end_time()
+    total_ticks = int(np.ceil(end_time / tick_duration))
+
+    if max_ticks is not None:
+        total_ticks = min(total_ticks, max_ticks)
+
+    # Initialize: (ticks, 88 pitches, 2 channels: velocity + duration)
+    sequence = np.zeros((total_ticks, NUM_PITCHES, 2), dtype=np.float32)
+
+    # Process all notes from all instruments
+    for instrument in midi.instruments:
+        if instrument.is_drum:
+            continue
+
+        for note in instrument.notes:
+            # Convert pitch to index (0-87)
+            pitch_idx = note.pitch - MIDI_CONFIG["min_pitch"]
+            if pitch_idx < 0 or pitch_idx >= NUM_PITCHES:
+                continue
+
+            # Convert time to tick
+            start_tick = int(note.start / tick_duration)
+            end_tick = int(note.end / tick_duration)
+
+            if start_tick >= total_ticks:
+                continue
+
+            # Duration in ticks (capped)
+            duration = min(end_tick - start_tick, MAX_DURATION_TICKS)
+            duration = max(duration, 1)  # At least 1 tick
+
+            # Velocity normalized to 0-1
+            velocity = note.velocity / 127.0
+
+            # Store at start tick
+            # If there's already a note, keep the louder one
+            if velocity > sequence[start_tick, pitch_idx, 0]:
+                sequence[start_tick, pitch_idx, 0] = velocity
+                sequence[start_tick, pitch_idx, 1] = duration / MAX_DURATION_TICKS  # Normalize duration
+
+    # Trim leading silence
+    if trim_silence:
+        tick_activity = np.any(sequence[:, :, 0] > 0, axis=1)
+        first_active = np.argmax(tick_activity)
+        if first_active > 0 and tick_activity[first_active]:
+            sequence = sequence[first_active:]
+
+    return sequence
+
+
+def tick_sequence_to_midi(sequence: np.ndarray, output_path: Path,
+                          ticks_per_beat: int = TICKS_PER_BEAT,
+                          tempo: float = DEFAULT_TEMPO,
+                          velocity_threshold: float = 0.1) -> None:
+    """
+    Convert tick sequence back to MIDI file.
+
+    Args:
+        sequence: Array of shape (num_ticks, 88, 2) - velocity and duration
+        output_path: Where to save MIDI
+        ticks_per_beat: Resolution (must match encoding)
+        tempo: BPM for output
+        velocity_threshold: Minimum velocity to create note
+    """
+    midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    piano = pretty_midi.Instrument(program=0)
+
+    beat_duration = 60.0 / tempo
+    tick_duration = beat_duration / ticks_per_beat
+
+    for tick_idx in range(len(sequence)):
+        for pitch_idx in range(NUM_PITCHES):
+            velocity = sequence[tick_idx, pitch_idx, 0]
+            duration_norm = sequence[tick_idx, pitch_idx, 1]
+
+            if velocity > velocity_threshold:
+                midi_pitch = pitch_idx + MIDI_CONFIG["min_pitch"]
+                start_time = tick_idx * tick_duration
+
+                # Denormalize duration
+                duration_ticks = max(1, int(duration_norm * MAX_DURATION_TICKS))
+                end_time = start_time + (duration_ticks * tick_duration)
+
+                note = pretty_midi.Note(
+                    velocity=int(velocity * 127),
+                    pitch=midi_pitch,
+                    start=start_time,
+                    end=end_time
+                )
+                piano.notes.append(note)
+
+    midi.instruments.append(piano)
+    midi.write(str(output_path))
+
+
+def play_tick_sequence(sequence: np.ndarray, ticks_per_beat: int = TICKS_PER_BEAT,
+                       tempo: float = DEFAULT_TEMPO, sample_rate: int = 22050):
+    """Play a tick sequence as audio."""
+    from IPython.display import Audio
+
+    midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    piano = pretty_midi.Instrument(program=0)
+
+    beat_duration = 60.0 / tempo
+    tick_duration = beat_duration / ticks_per_beat
+
+    for tick_idx in range(len(sequence)):
+        for pitch_idx in range(NUM_PITCHES):
+            velocity = sequence[tick_idx, pitch_idx, 0]
+            duration_norm = sequence[tick_idx, pitch_idx, 1]
+
+            if velocity > 0.1:
+                midi_pitch = pitch_idx + MIDI_CONFIG["min_pitch"]
+                start_time = tick_idx * tick_duration
+                duration_ticks = max(1, int(duration_norm * MAX_DURATION_TICKS))
+                end_time = start_time + (duration_ticks * tick_duration)
+
+                note = pretty_midi.Note(
+                    velocity=int(velocity * 127),
+                    pitch=midi_pitch,
+                    start=start_time,
+                    end=end_time
+                )
+                piano.notes.append(note)
+
+    midi.instruments.append(piano)
+
+    if _check_fluidsynth():
+        audio_data = midi.fluidsynth(fs=sample_rate)
+    else:
+        audio_data = midi.synthesize(fs=sample_rate)
+
+    return Audio(audio_data, rate=sample_rate)
+
+
+# =============================================================================
 # AUDIO PLAYBACK
 # =============================================================================
 
@@ -439,15 +622,17 @@ def play_midi_file(midi_path: Path, sample_rate: int = 22050):
 @torch.no_grad()
 def generate_music(model: nn.Module, seed_sequence: np.ndarray,
                    num_frames: int, temperature: float = 1.0,
-                   device: torch.device = None, show_progress: bool = True) -> np.ndarray:
+                   top_k: int = 8, device: torch.device = None,
+                   show_progress: bool = True) -> np.ndarray:
     """
-    Generate music from a seed sequence.
+    Generate music from a seed sequence using top-k sampling.
 
     Args:
         model: Trained model (outputs logits, not probabilities)
         seed_sequence: Initial sequence (seq_len, num_pitches)
         num_frames: Number of frames to generate
         temperature: Sampling temperature (higher = more random)
+        top_k: Maximum notes per frame (typical piano: 1-10 notes)
         device: Torch device
         show_progress: Show progress bar
 
@@ -475,11 +660,16 @@ def generate_music(model: nn.Module, seed_sequence: np.ndarray,
             next_logits = next_logits / temperature
 
         next_probs = 1 / (1 + np.exp(-next_logits))
-        binary_frame = (np.random.random(next_probs.shape) < next_probs).astype(np.float32)
 
-        # Use fixed velocity (0.7) for notes that are "on", not the raw probability
-        # This ensures notes are audible (above the 0.3 playback threshold)
-        next_frame = binary_frame * 0.7
+        # Top-k sampling: only keep the k most likely notes
+        # This prevents the "noise everywhere" problem
+        next_frame = np.zeros_like(next_probs)
+        top_indices = np.argsort(next_probs)[-top_k:]  # Get top k indices
+
+        for idx in top_indices:
+            # Sample based on probability, but only from top-k candidates
+            if np.random.random() < next_probs[idx]:
+                next_frame[idx] = 0.7  # Fixed velocity for audibility
 
         generated.append(next_frame)
 
@@ -491,7 +681,7 @@ def generate_music(model: nn.Module, seed_sequence: np.ndarray,
 
 def create_random_seed(sequence_length: int = SEQUENCE_LENGTH,
                        num_pitches: int = NUM_PITCHES) -> np.ndarray:
-    """Create a random seed with sparse notes for generation."""
+    """Create a random seed with sparse notes for generation (piano roll)."""
     seed = np.zeros((sequence_length, num_pitches), dtype=np.float32)
 
     for i in range(0, sequence_length, 8):
@@ -504,6 +694,104 @@ def create_random_seed(sequence_length: int = SEQUENCE_LENGTH,
                 seed[i + j, p] = velocity
 
     return seed
+
+
+def create_random_tick_seed(sequence_length: int = SEQUENCE_LENGTH) -> np.ndarray:
+    """Create a random seed for tick-based generation.
+
+    Returns: (seq_len, 88, 2) array with velocity and duration channels.
+    """
+    seed = np.zeros((sequence_length, NUM_PITCHES, 2), dtype=np.float32)
+
+    # Add some random notes every few ticks
+    for i in range(0, sequence_length, 4):  # Every beat
+        num_notes = random.randint(1, 4)
+        pitches = random.sample(range(20, 60), num_notes)  # Middle register
+        for p in pitches:
+            velocity = random.uniform(0.5, 0.9)
+            duration = random.randint(2, 8) / MAX_DURATION_TICKS  # Normalized
+            seed[i, p, 0] = velocity
+            seed[i, p, 1] = duration
+
+    return seed
+
+
+@torch.no_grad()
+def generate_tick_music(model: nn.Module, seed_sequence: np.ndarray,
+                        num_ticks: int, temperature: float = 1.0,
+                        top_k: int = 6, device: torch.device = None,
+                        show_progress: bool = True) -> np.ndarray:
+    """
+    Generate tick-based music from a seed sequence.
+
+    Args:
+        model: Trained model (input/output: 176 dims = 88 pitches × 2 channels)
+        seed_sequence: Shape (seq_len, 88, 2) or (seq_len, 176)
+        num_ticks: Number of ticks to generate
+        temperature: Sampling temperature
+        top_k: Max notes per tick
+        device: Torch device
+        show_progress: Show progress bar
+
+    Returns:
+        Array of shape (seed_len + num_ticks, 88, 2)
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    model.eval()
+
+    # Ensure seed is flattened: (seq_len, 176)
+    if seed_sequence.ndim == 3:
+        seed_flat = seed_sequence.reshape(len(seed_sequence), -1)
+    else:
+        seed_flat = seed_sequence
+
+    current_seq = torch.FloatTensor(seed_flat).unsqueeze(0).to(device)
+    generated_flat = list(seed_flat)
+    hidden = model.init_hidden(1, device)
+
+    iterator = range(num_ticks)
+    if show_progress:
+        iterator = tqdm(iterator, desc="Generating")
+
+    for _ in iterator:
+        output, hidden = model(current_seq, hidden)
+        next_logits = output[0, -1].cpu().numpy()  # Shape: (176,)
+
+        if temperature != 1.0:
+            next_logits = next_logits / temperature
+
+        # Split into velocity (88) and duration (88) predictions
+        vel_logits = next_logits[:NUM_PITCHES]
+        dur_logits = next_logits[NUM_PITCHES:]
+
+        # Convert velocity logits to probabilities
+        vel_probs = 1 / (1 + np.exp(-vel_logits))
+
+        # Top-k sampling for velocities
+        next_vel = np.zeros(NUM_PITCHES, dtype=np.float32)
+        next_dur = np.zeros(NUM_PITCHES, dtype=np.float32)
+
+        top_indices = np.argsort(vel_probs)[-top_k:]
+
+        for idx in top_indices:
+            if np.random.random() < vel_probs[idx]:
+                next_vel[idx] = np.clip(vel_probs[idx] + 0.2, 0.3, 1.0)  # Ensure audible
+                # Duration: sigmoid and clamp
+                next_dur[idx] = np.clip(1 / (1 + np.exp(-dur_logits[idx])), 0.1, 1.0)
+
+        # Combine and append
+        next_frame = np.concatenate([next_vel, next_dur])
+        generated_flat.append(next_frame)
+
+        # Update sequence
+        next_tensor = torch.FloatTensor(next_frame).unsqueeze(0).unsqueeze(0).to(device)
+        current_seq = torch.cat([current_seq[:, 1:, :], next_tensor], dim=1)
+
+    # Reshape back to (ticks, 88, 2)
+    result = np.array(generated_flat).reshape(-1, NUM_PITCHES, 2)
+    return result
 
 
 # =============================================================================
@@ -532,6 +820,46 @@ class MidiDataset(Dataset):
 
         self.sequences = np.array(self.sequences)
         self.targets = np.array(self.targets)
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.FloatTensor(self.sequences[idx]),
+            torch.FloatTensor(self.targets[idx])
+        )
+
+
+class TickDataset(Dataset):
+    """
+    PyTorch Dataset for tick-based MIDI sequences.
+
+    Input shape per sequence: (seq_len, 88, 2) -> flattened to (seq_len, 176)
+    """
+
+    def __init__(self, tick_sequences: List[np.ndarray],
+                 sequence_length: int = SEQUENCE_LENGTH,
+                 stride: int = STRIDE):
+        self.sequences = []
+        self.targets = []
+
+        for seq in tick_sequences:
+            # Flatten (ticks, 88, 2) to (ticks, 176)
+            flat = seq.reshape(len(seq), -1)
+
+            for i in range(0, len(flat) - sequence_length - 1, stride):
+                x = flat[i:i + sequence_length]
+                y = flat[i + 1:i + sequence_length + 1]
+                self.sequences.append(x)
+                self.targets.append(y)
+
+        if self.sequences:
+            self.sequences = np.array(self.sequences)
+            self.targets = np.array(self.targets)
+        else:
+            self.sequences = np.empty((0, sequence_length, TICK_FEATURES))
+            self.targets = np.empty((0, sequence_length, TICK_FEATURES))
 
     def __len__(self) -> int:
         return len(self.sequences)
