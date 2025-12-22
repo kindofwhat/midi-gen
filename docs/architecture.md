@@ -1,0 +1,467 @@
+# MusicGPT Architecture for MIDI Generation
+
+This document explains the complete architecture for MIDI music generation, including tokenization, model architecture, training, and generation.
+
+## Overview
+
+The system treats music generation as a **language modeling task**: predict the next token given previous tokens.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          COMPLETE PIPELINE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   MIDI File (.mid)                                                          │
+│        │                                                                    │
+│        ▼ midi_file_to_tokens()                                              │
+│   ┌─────────────────────────────────────────┐                               │
+│   │  Token Sequence                         │                               │
+│   │  [BOS, event1, event2, ..., EOS]        │                               │
+│   │  Each event = 8 tokens                  │                               │
+│   └─────────────────────────────────────────┘                               │
+│        │                                                                    │
+│        ▼ flatten_tokens()                                                   │
+│   ┌─────────────────────────────────────────┐                               │
+│   │  Flat Sequence                          │                               │
+│   │  [1, 0, 0, 0, 0, 0, 0, 0, 3, 9, ...]    │                               │
+│   └─────────────────────────────────────────┘                               │
+│        │                                                                    │
+│        ▼ MusicGPT                                                           │
+│   ┌─────────────────────────────────────────┐                               │
+│   │  Next Token Prediction                  │                               │
+│   │  P(token_t | token_1, ..., token_{t-1}) │                               │
+│   └─────────────────────────────────────────┘                               │
+│        │                                                                    │
+│        ▼ unflatten_tokens()                                                 │
+│   ┌─────────────────────────────────────────┐                               │
+│   │  Token Sequence (num_events, 8)         │                               │
+│   └─────────────────────────────────────────┘                               │
+│        │                                                                    │
+│        ▼ tokens_to_midi_file()                                              │
+│   MIDI File (.mid)                                                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Part 1: MIDI Tokenization
+
+### Why Tokenize MIDI?
+
+MIDI files are binary event streams. Neural networks need numerical sequences. The tokenizer bridges this gap.
+
+**Alternative approaches:**
+| Approach | Pros | Cons |
+|----------|------|------|
+| Piano Roll (88×T matrix) | Simple, visual | Dense, slow, loses timing precision |
+| Raw MIDI bytes | Complete info | Too low-level, variable length events |
+| **Event Tokens** | Sparse, structured, proven | Requires careful design |
+
+### Token Format
+
+Each MIDI event becomes **8 tokens**:
+
+```
+┌───────────────────────────────────────────────────────────────────────────┐
+│  Event Token Structure (8 tokens per event)                               │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  Position:  [0]      [1]     [2]     [3]    [4]      [5]     [6]    [7]   │
+│  Meaning:   event    time1   time2   track  param1   param2  param3 param4│
+│                                                                           │
+│  Example (note event):                                                    │
+│  [3, 9, 8, 147, 16, 188, 208, 265]                                        │
+│   │  │  │   │    │    │    │    └─ duration (how long)                    │
+│   │  │  │   │    │    │    └────── velocity (how loud)                    │
+│   │  │  │   │    │    └─────────── pitch (which note: 60=C4)              │
+│   │  │  │   │    └──────────────── channel (instrument group)             │
+│   │  │  │   └───────────────────── track number                           │
+│   │  │  └───────────────────────── time2 (fine: 0-15 sixteenth notes)     │
+│   │  └──────────────────────────── time1 (coarse: delta from last event)  │
+│   └─────────────────────────────── event_type (3 = "note")                │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+### Event Types
+
+| ID | Event Type | Parameters | Purpose |
+|----|------------|------------|---------|
+| 3 | `note` | channel, pitch, velocity, duration | Musical notes |
+| 4 | `patch_change` | channel, patch | Change instrument |
+| 5 | `control_change` | channel, controller, value | Pedal, volume, etc. |
+| 6 | `set_tempo` | bpm | Tempo changes |
+| 7 | `time_signature` | nn, dd | Time signature |
+| 8 | `key_signature` | sf, mi | Key signature |
+
+### Vocabulary Breakdown (~3406 tokens)
+
+```python
+Token ID ranges:
+├── 0          PAD (padding)
+├── 1          BOS (begin of sequence)
+├── 2          EOS (end of sequence)
+├── 3-8        Event types (6 types)
+├── 9-136      time1 (128 values: coarse time)
+├── 137-152    time2 (16 values: fine time)
+├── 153-280    track (128 values)
+├── 281-296    channel (16 values)
+├── 297-424    pitch (128 values: MIDI notes 0-127)
+├── 425-552    velocity (128 values: 0-127)
+├── 553-680    patch (128 values: GM instruments)
+├── 681-808    controller (128 values: CC numbers)
+├── 809-936    value (128 values: CC values)
+├── 937-1320   bpm (384 values: tempo)
+├── 1321-2368  duration (2048 values: note length)
+├── ...        (remaining parameters)
+└── ~3406      Total vocabulary size
+```
+
+### Time Encoding: Relative, Not Absolute
+
+**Critical for understanding generation:**
+
+```
+Event 1: time1=0,  time2=0   → absolute = 0
+Event 2: time1=2,  time2=8   → absolute = 0 + (2×16 + 8) = 40 sixteenths
+Event 3: time1=1,  time2=4   → absolute = 40 + (1×16 + 4) = 60 sixteenths
+         ↑
+         DELTA from previous, not absolute time!
+```
+
+This is why **seed-based continuation is hard**: the model learns to generate time deltas from the previous event, not absolute positions.
+
+## Part 2: MusicGPT Model Architecture
+
+### Design Choice: Why Transformer?
+
+| Architecture | Complexity | Long-range | Status |
+|--------------|-----------|------------|--------|
+| LSTM | O(N) | Poor | Baseline |
+| Mamba (SSM) | O(N) | Good | Experimental |
+| **Transformer** | O(N²) | Excellent | **Proven for music** |
+
+For sequences of 512 tokens, O(N²) is acceptable. Transformers are battle-tested for music (MuseNet, Music Transformer, MusicLM).
+
+### Model Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         MusicGPT                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Input: Token IDs (batch, seq_len=512)                         │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
+│   │  Token Embedding                        │                   │
+│   │  nn.Embedding(3406, 256, padding_idx=0) │                   │
+│   │  → (batch, 512, 256)                    │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
+│   │  Positional Embedding                   │                   │
+│   │  nn.Embedding(576, 256)                 │                   │
+│   │  + (learned, not sinusoidal)            │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
+│   │  Dropout (0.1)                          │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
+│   │  Transformer Decoder Block × 6          │                   │
+│   │  (see detailed view below)              │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
+│   │  Language Model Head                    │                   │
+│   │  nn.Linear(256, 3406)                   │                   │
+│   │  → (batch, 512, 3406) logits            │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   Output: Logits (batch, seq_len, vocab_size)                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Transformer Decoder Block (×6)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  TransformerDecoderLayer                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Input x (batch, seq_len, d_model=256)                         │
+│              │                                                  │
+│              ▼                                                  │
+│   ┌──────────────────────────────────────┐                      │
+│   │  Multi-Head Self-Attention           │                      │
+│   │  • 8 heads, head_dim = 32            │                      │
+│   │  • Causal mask (can't see future)    │                      │
+│   │  • Q, K, V all from same input       │                      │
+│   └──────────────────────────────────────┘                      │
+│              │                                                  │
+│              ├──────────── + (residual)                         │
+│              ▼                                                  │
+│   ┌──────────────────────────────────────┐                      │
+│   │  LayerNorm                           │                      │
+│   └──────────────────────────────────────┘                      │
+│              │                                                  │
+│              ▼                                                  │
+│   ┌──────────────────────────────────────┐                      │
+│   │  Feed-Forward Network                │                      │
+│   │  Linear(256 → 1024) + ReLU           │                      │
+│   │  Dropout(0.1)                        │                      │
+│   │  Linear(1024 → 256)                  │                      │
+│   └──────────────────────────────────────┘                      │
+│              │                                                  │
+│              ├──────────── + (residual)                         │
+│              ▼                                                  │
+│   ┌──────────────────────────────────────┐                      │
+│   │  LayerNorm                           │                      │
+│   └──────────────────────────────────────┘                      │
+│              │                                                  │
+│              ▼                                                  │
+│   Output (batch, seq_len, d_model=256)                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Causal Masking
+
+The model can only attend to **past and present** tokens, not future ones:
+
+```
+Query positions →
+         0   1   2   3   4
+Key   0 [✓] [✗] [✗] [✗] [✗]
+pos   1 [✓] [✓] [✗] [✗] [✗]
+↓     2 [✓] [✓] [✓] [✗] [✗]
+      3 [✓] [✓] [✓] [✓] [✗]
+      4 [✓] [✓] [✓] [✓] [✓]
+
+✓ = can attend, ✗ = masked (set to -inf before softmax)
+```
+
+This ensures autoregressive generation: each token prediction only uses information from previous tokens.
+
+### Parameter Count
+
+```python
+Component                              Parameters
+─────────────────────────────────────────────────
+Token Embedding (3406 × 256)           872,000
+Position Embedding (576 × 256)         147,456
+Transformer Blocks (6×):
+  ├─ Self-Attention (4 × 256²)         262,144 × 6
+  ├─ FFN (256×1024 + 1024×256)         524,288 × 6
+  └─ LayerNorms (2 × 256 × 2)          1,024 × 6
+LM Head (256 × 3406)                   872,000
+─────────────────────────────────────────────────
+Total                                  ~8.2M parameters
+```
+
+## Part 3: Training
+
+### Task: Next Token Prediction
+
+Given tokens `[t₁, t₂, ..., tₙ]`, predict `[t₂, t₃, ..., tₙ₊₁]`.
+
+```
+Input:  [BOS, 3, 9, 8, 147, 16, 188, 208, 265, 3, 9, 12, ...]
+Target: [3, 9, 8, 147, 16, 188, 208, 265, 3, 9, 12, 150, ...]
+         ↑
+         Shifted by 1 position
+```
+
+### Loss Function: Cross-Entropy
+
+```python
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+```
+
+- Compares predicted probability distribution over 3406 tokens with actual next token
+- Ignores PAD tokens (don't penalize predictions at padding positions)
+- Reports as **perplexity** = exp(loss) for interpretability
+
+### Dataset Creation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Sliding Window Dataset                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Original sequence (one MIDI file, ~9000 tokens):               │
+│  [t₁, t₂, t₃, t₄, t₅, t₆, t₇, t₈, t₉, t₁₀, ...]                 │
+│                                                                 │
+│  SEQUENCE_LENGTH = 512                                          │
+│  STRIDE = 256 (50% overlap)                                     │
+│                                                                 │
+│  Sample 1: [t₁ ... t₅₁₂]     (positions 0-511)                  │
+│  Sample 2: [t₂₅₇ ... t₇₆₈]   (positions 256-767)                │
+│  Sample 3: [t₅₁₃ ... t₁₀₂₄]  (positions 512-1023)               │
+│  ...                                                            │
+│                                                                 │
+│  Total samples = (seq_len - 512) / 256 per file                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Training Configuration
+
+```python
+SEQUENCE_LENGTH = 512      # Context window
+STRIDE = 256               # 50% overlap between samples
+BATCH_SIZE = 32            # Samples per batch
+LEARNING_RATE = 3e-4       # Initial LR
+WEIGHT_DECAY = 0.01        # AdamW regularization
+GRAD_CLIP = 1.0            # Gradient clipping
+NUM_EPOCHS = 30            # Max epochs
+EARLY_STOPPING = 5         # Patience for early stopping
+```
+
+### Learning Rate Schedule
+
+```
+ReduceLROnPlateau:
+├─ Monitor: validation loss
+├─ Factor: 0.5 (halve LR when plateau)
+├─ Patience: 2 epochs
+└─ Triggers when val_loss stops improving
+```
+
+### Overfitting Prevention
+
+| Technique | Setting | Purpose |
+|-----------|---------|---------|
+| Dropout | 0.1 | Random neuron deactivation |
+| Weight Decay | 0.01 | L2 regularization |
+| Early Stopping | patience=5 | Stop when val_loss plateaus |
+| More Data | 11k files | Best regularization |
+
+## Part 4: Generation
+
+### Autoregressive Sampling
+
+```python
+@torch.no_grad()
+def generate(model, seed_tokens, max_events, temperature, top_k, top_p):
+    generated = list(seed_tokens)  # Start with BOS or seed
+
+    for _ in range(max_events * 8):  # 8 tokens per event
+        # Get last 512 tokens as context
+        context = generated[-SEQUENCE_LENGTH:]
+
+        # Forward pass
+        logits = model(context)[-1]  # Last position
+
+        # Temperature scaling
+        logits = logits / temperature
+
+        # Top-k filtering
+        if top_k > 0:
+            top_k_logits, _ = torch.topk(logits, top_k)
+            logits[logits < top_k_logits[-1]] = -inf
+
+        # Top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_probs = softmax(logits).sort(descending=True)
+            cumsum = sorted_probs.cumsum(dim=-1)
+            mask = cumsum > top_p
+            logits[mask] = -inf
+
+        # Sample
+        probs = softmax(logits)
+        next_token = torch.multinomial(probs, 1)
+
+        generated.append(next_token)
+
+        if next_token == EOS_ID:
+            break
+
+    return generated
+```
+
+### Sampling Parameters
+
+| Parameter | Effect | Recommended |
+|-----------|--------|-------------|
+| `temperature=0.5` | Conservative, repetitive | Safe choice |
+| `temperature=0.8` | Balanced creativity | **Default** |
+| `temperature=1.0` | Original distribution | More varied |
+| `temperature=1.2+` | Very creative, chaotic | Experimental |
+| `top_k=30` | Only consider top 30 tokens | Reduces noise |
+| `top_p=0.95` | Nucleus sampling | Alternative to top_k |
+
+### Degeneration Detection
+
+The model can "degenerate" - produce invalid tokens. We detect this:
+
+```python
+# Valid event types are 1-8 (BOS, EOS, note, patch_change, etc.)
+# If event_type > 100, something went wrong
+if generated_event[0] > 100:
+    print("Degeneration detected!")
+    break
+```
+
+## Part 5: File Structure
+
+```
+midi-gen/
+├── midi_tokenizer.py       # Unified tokenizer class
+├── midi_training.ipynb     # Training notebook
+├── midi_generation.ipynb   # Generation notebook
+├── midi_data/
+│   ├── adl-piano-midi/     # Training data (~11k MIDI files)
+│   ├── best_model_lm.pt    # Trained model checkpoint
+│   └── generated/          # Generated outputs
+├── midi-model/
+│   └── MIDI.py             # Low-level MIDI parser
+└── docs/
+    └── architecture.md     # This document
+```
+
+## Part 6: Checkpoint Format
+
+```python
+torch.save({
+    'epoch': epoch,                      # Training epoch
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'val_loss': val_loss,                # Best validation loss
+    'vocab_size': VOCAB_SIZE,            # 3406
+    'sequence_length': SEQUENCE_LENGTH,  # 512
+}, 'best_model_lm.pt')
+```
+
+## Limitations & Known Issues
+
+### 1. Seed-Based Continuation
+The model struggles to continue from arbitrary seed sequences because:
+- Trained only on sequences starting with BOS
+- Time encoding is relative (deltas), not absolute
+- Model expects to "build up" context from scratch
+
+**Workaround:** Use seed as "style context" but generate fresh from BOS.
+
+### 2. Long-Term Structure
+512 tokens ≈ 64 events ≈ 4-8 bars of music. The model can't plan longer structures (verse-chorus, sonata form).
+
+### 3. Degeneration
+After many generation steps, the model can produce invalid tokens. This indicates:
+- Insufficient training
+- Model drifting into out-of-distribution states
+
+## References
+
+1. [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - Transformer architecture
+2. [Language Models are Unsupervised Multitask Learners](https://openai.com/research/better-language-models) - GPT-2
+3. [Music Transformer](https://arxiv.org/abs/1809.04281) - Transformers for music
+4. [SkyTNT/midi-model](https://github.com/SkyTNT/midi-model) - Tokenizer source
+5. [ADL Piano MIDI Dataset](https://github.com/lucasnfe/adl-piano-midi) - Training data
