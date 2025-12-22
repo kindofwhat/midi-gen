@@ -5,8 +5,10 @@
 # Core ML framework
 torch>=2.0.0
 
-# Mamba SSM - Pure PyTorch implementation (cross-platform)
-mambapy>=0.0.2
+# Mamba SSM - CUDA optimized (NVIDIA GPU only)
+# Install separately on CUDA machines: pip install mamba-ssm causal-conv1d
+# mamba-ssm>=2.0.0
+# causal-conv1d>=1.2.0
 
 # Numerical computing
 numpy>=1.24.0
