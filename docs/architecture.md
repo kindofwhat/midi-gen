@@ -167,6 +167,14 @@ For sequences of 512 tokens, O(N²) is acceptable. Transformers are battle-teste
 │                         │                                       │
 │                         ▼                                       │
 │   ┌─────────────────────────────────────────┐                   │
+│   │  Position-in-Event Embedding (NEW)      │                   │
+│   │  nn.Embedding(8, 256)                   │                   │
+│   │  position % 8 → tells model "you're at  │                   │
+│   │  position 3 of an 8-token event"        │                   │
+│   └─────────────────────────────────────────┘                   │
+│                         │                                       │
+│                         ▼                                       │
+│   ┌─────────────────────────────────────────┐                   │
 │   │  Dropout (0.1)                          │                   │
 │   └─────────────────────────────────────────┘                   │
 │                         │                                       │
@@ -410,18 +418,59 @@ if generated_event[0] > 100:
     break
 ```
 
+### Constrained Decoding (Key Improvement)
+
+Raw model output is often poor quality. We apply constraints during generation:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Constrained Decoding                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. CONTROL EVENT PENALTY (ctrl_penalty=10.0)                   │
+│     - Reduces logits for control_change events (type=5)         │
+│     - Prevents "pedal spam" (excessive sustain/volume events)   │
+│                                                                 │
+│  2. NOTE RATIO ENFORCEMENT (min_note_ratio=0.8)                 │
+│     - Tracks ratio of note events vs total                      │
+│     - If below 80%, boosts note logits (+3.0)                   │
+│     - Suppresses metadata events (-2.0)                         │
+│                                                                 │
+│  3. PITCH REPETITION PENALTY (pitch_repeat_penalty=3.0)         │
+│     - Remembers last N pitches (pitch_memory=12)                │
+│     - Penalizes recently used pitches at position 5             │
+│     - Forces melodic variety instead of same note               │
+│                                                                 │
+│  4. PAD TOKEN ENFORCEMENT                                       │
+│     - Each event type uses specific number of tokens            │
+│     - note=8, time_sig=6, tempo=5, etc.                         │
+│     - Force PAD for unused positions                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Results with constraints:**
+
+| Metric | Without | With Constraints |
+|--------|---------|------------------|
+| Unique pitches | 1 | 30+ |
+| Note ratio | ~20% | 95%+ |
+| Events before degeneration | 2 | 60-100 |
+| Musical quality | Random noise | Recognizable music |
+
 ## Part 5: File Structure
 
 ```
 midi-gen/
 ├── midi_tokenizer.py       # Unified tokenizer class
 ├── midi_training.ipynb     # Training notebook
-├── midi_generation.ipynb   # Generation notebook
+├── midi_generation.ipynb   # Generation notebook (with constrained decoding)
 ├── midi_data/
 │   ├── adl-piano-midi/     # Training data (~11k MIDI files)
 │   ├── best_model_lm.pt    # Trained model checkpoint
 │   └── generated/          # Generated outputs
 ├── midi-model/
+│   ├── model.py            # MusicGPT model class (shared)
 │   └── MIDI.py             # Low-level MIDI parser
 └── docs/
     └── architecture.md     # This document
@@ -431,32 +480,50 @@ midi-gen/
 
 ```python
 torch.save({
-    'epoch': epoch,                      # Training epoch
+    'epoch': epoch,                      # Training epoch (best: 30)
     'model_state_dict': model.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
-    'val_loss': val_loss,                # Best validation loss
+    'val_loss': val_loss,                # Best validation loss (~0.73)
     'vocab_size': VOCAB_SIZE,            # 3406
     'sequence_length': SEQUENCE_LENGTH,  # 512
+    'tokens_per_event': 8,               # Event structure (NEW)
 }, 'best_model_lm.pt')
+```
+
+### Training Results
+
+```
+Dataset: 11,076 MIDI files (ADL Piano MIDI)
+         8,709 training / 1,095 validation
+         ~80M tokens total
+
+Training: 35 epochs (early stopped at epoch 35)
+          Best val_loss: 0.7274 (perplexity 2.1)
+          Time: ~5 hours on CUDA
 ```
 
 ## Limitations & Known Issues
 
 ### 1. Seed-Based Continuation
-The model struggles to continue from arbitrary seed sequences because:
-- Trained only on sequences starting with BOS
-- Time encoding is relative (deltas), not absolute
-- Model expects to "build up" context from scratch
-
-**Workaround:** Use seed as "style context" but generate fresh from BOS.
+The model can continue from seed sequences, starting with the seed then diverging:
+- Use first 30-50 events as context
+- Model continues in similar style
+- Works best with seeds from training data genres
 
 ### 2. Long-Term Structure
 512 tokens ≈ 64 events ≈ 4-8 bars of music. The model can't plan longer structures (verse-chorus, sonata form).
 
 ### 3. Degeneration
-After many generation steps, the model can produce invalid tokens. This indicates:
-- Insufficient training
-- Model drifting into out-of-distribution states
+After 60-100 events, the model can produce invalid tokens:
+- Detected by event_type > 20
+- Stop generation and keep valid portion
+- Constrained decoding delays but doesn't prevent this
+
+### 4. Quality
+The model produces recognizable music but:
+- Limited harmonic sophistication
+- Benefits from higher temperature for variety
+- Constrained decoding is essential for usable output
 
 ## References
 
