@@ -210,3 +210,4 @@ __marimo__/
 *.iml
 **/*.zip
 **/*.pt
+**/.DS_Store
