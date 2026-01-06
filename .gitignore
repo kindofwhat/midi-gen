@@ -209,5 +209,4 @@ __marimo__/
 /sprec1@vertex.ti.bfh.ch
 *.iml
 **/*.zip
-**/*.pt
 **/.DS_Store
