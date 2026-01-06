@@ -50,6 +50,7 @@ The system treats music generation as a **language modeling task**: predict the 
 MIDI files are binary event streams. Neural networks need numerical sequences. The tokenizer bridges this gap.
 
 **Alternative approaches:**
+
 | Approach | Pros | Cons |
 |----------|------|------|
 | Piano Roll (88×T matrix) | Simple, visual | Dense, slow, loses timing precision |
@@ -93,27 +94,32 @@ Each MIDI event becomes **8 tokens**:
 | 7 | `time_signature` | nn, dd | Time signature |
 | 8 | `key_signature` | sf, mi | Key signature |
 
-### Vocabulary Breakdown (~3406 tokens)
+### Vocabulary Breakdown (3406 tokens)
 
-```python
-Token ID ranges:
-├── 0          PAD (padding)
-├── 1          BOS (begin of sequence)
-├── 2          EOS (end of sequence)
-├── 3-8        Event types (6 types)
-├── 9-136      time1 (128 values: coarse time)
-├── 137-152    time2 (16 values: fine time)
-├── 153-280    track (128 values)
-├── 281-296    channel (16 values)
-├── 297-424    pitch (128 values: MIDI notes 0-127)
-├── 425-552    velocity (128 values: 0-127)
-├── 553-680    patch (128 values: GM instruments)
-├── 681-808    controller (128 values: CC numbers)
-├── 809-936    value (128 values: CC values)
-├── 937-1320   bpm (384 values: tempo)
-├── 1321-2368  duration (2048 values: note length)
-├── ...        (remaining parameters)
-└── ~3406      Total vocabulary size
+Token IDs are allocated sequentially in dictionary insertion order (see `midi-model/midi_tokenizer.py`):
+
+```
+Token ID ranges (MIDITokenizerV2):
+├── 0            PAD (padding)
+├── 1            BOS (begin of sequence)
+├── 2            EOS (end of sequence)
+├── 3-8          Event types (6 types: note, patch_change, control_change, set_tempo, time_signature, key_signature)
+├── 9-136        time1 (128 values: coarse time, delta from previous event)
+├── 137-152      time2 (16 values: fine time, 0-15 sixteenth notes)
+├── 153-2200     duration (2048 values: note length in sixteenth notes)
+├── 2201-2328    track (128 values: MIDI track number)
+├── 2329-2344    channel (16 values: MIDI channel 0-15, channel 9 = drums)
+├── 2345-2472    pitch (128 values: MIDI notes 0-127)
+├── 2473-2600    velocity (128 values: note velocity 0-127)
+├── 2601-2728    patch (128 values: GM instrument programs 0-127)
+├── 2729-2856    controller (128 values: CC numbers 0-127)
+├── 2857-2984    value (128 values: CC values 0-127)
+├── 2985-3368    bpm (384 values: tempo 1-384 BPM)
+├── 3369-3384    nn (16 values: time signature numerator 1-16)
+├── 3385-3388    dd (4 values: time signature denominator 2^1 to 2^4)
+├── 3389-3403    sf (15 values: key signature -7 to +7 sharps/flats, encoded as 0-14)
+├── 3404-3405    mi (2 values: mode indicator, 0=major, 1=minor)
+└── 3406         Total vocabulary size
 ```
 
 ### Time Encoding: Relative, Not Absolute
